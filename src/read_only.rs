@@ -27,9 +27,10 @@
 
 use std::collections::VecDeque;
 
-use crate::eraftpb::Message;
+use slog::Logger;
 
-use hashbrown::{HashMap, HashSet};
+use crate::eraftpb::Message;
+use crate::{HashMap, HashSet};
 
 /// Determines the relative safety of and consistency of read only requests.
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -129,11 +130,11 @@ impl ReadOnly {
     /// Advances the read only request queue kept by the ReadOnly struct.
     /// It dequeues the requests until it finds the read only request that has
     /// the same context as the given `m`.
-    pub fn advance(&mut self, m: &Message) -> Vec<ReadIndexStatus> {
+    pub fn advance(&mut self, m: &Message, logger: &Logger) -> Vec<ReadIndexStatus> {
         let mut rss = vec![];
         if let Some(i) = self.read_index_queue.iter().position(|x| {
             if !self.pending_read_index.contains_key(x) {
-                panic!("cannot find correspond read state from pending map");
+                fatal!(logger, "cannot find correspond read state from pending map");
             }
             *x == m.context
         }) {

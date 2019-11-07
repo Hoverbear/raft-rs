@@ -16,31 +16,36 @@ edition = "2018"
 members = ["proto", "harness"]
 
 [features]
-default = ["protobuf-codec"]
+default = ["protobuf-codec", "default-logger"]
 # Enable failpoints
 failpoints = ["fail/failpoints"]
 protobuf-codec = ["raft-proto/protobuf-codec"]
 prost-codec = ["raft-proto/prost-codec"]
+default-logger = ["slog-stdlog", "slog-envlogger", "slog-term"]
 
 # Make sure to synchronize updates with Harness.
 [dependencies]
-log = "~0.4.7"
-protobuf = "~2.8.0"
-slog = "~2.5.2"
-quick-error = "~1.2.2"
+protobuf = "2"
+slog = "2"
+slog-stdlog = { version = "4", optional = true }
+slog-envlogger = { version = "2", optional = true }
+slog-term = { version = "2", optional = true }
+quick-error = "1"
 raft-proto = { path = "proto", version = "0.6.0-alpha", default-features = false }
-rand = "~0.7.0"
-hashbrown = "~0.5.0"
-fail = { version = "~0.3.0", optional = true }
-getset = "~0.0.7"
-slog-stdlog = "~3.0.5"
-slog-envlogger = "~2.1.0"
+# Stick with 0.6 (rather than 0.7) for now, since most of the ecosystem has not
+# upgraded yet and this saves duplicate deps.
+rand = "0.6"
+fxhash = "0.2"
+fail = { version = "0.3", optional = true }
+getset = "0.0.9"
 
 [dev-dependencies]
-criterion = "~0.2.11"
-regex = "~1.2.0"
-slog-async = "~2.3.0"
-slog-term = "~2.4.1"
+criterion = "0.3"
+regex = "1.1"
+slog-stdlog = "4"
+slog-envlogger = "2.1"
+slog-async = "2.3"
+slog-term = "2.4"
 
 [[bench]]
 name = "benches"

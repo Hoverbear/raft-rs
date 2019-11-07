@@ -40,19 +40,22 @@ use raft::{
     storage::MemStorage,
     raw_node::RawNode,
 };
+use slog::{Drain, o};
 
 // Select some defaults, then change what we need.
 let config = Config {
     id: 1,
     ..Default::default()
 };
+// Initialize logger.
+let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
 // ... Make any configuration changes.
 // After, make sure it's valid!
 config.validate().unwrap();
 // We'll use the built-in `MemStorage`, but you will likely want your own.
 // Finally, create our Raft node!
 let storage = MemStorage::new_with_conf_state((vec![1], vec![]));
-let mut node = RawNode::new(&config, storage).unwrap();
+let mut node = RawNode::new(&config, storage, &logger).unwrap();
 // We will coax it into being the lead of a single node cluster for exploration.
 node.raft.become_candidate();
 node.raft.become_leader();
@@ -65,10 +68,12 @@ channel `recv_timeout` to drive the Raft node at least every 100ms, calling
 [`tick()`](raw_node/struct.RawNode.html#method.tick) each time.
 
 ```rust
+# use slog::{Drain, o};
 # use raft::{Config, storage::MemStorage, raw_node::RawNode};
 # let config = Config { id: 1, ..Default::default() };
 # let store = MemStorage::new_with_conf_state((vec![1], vec![]));
-# let mut node = RawNode::new(&config, store).unwrap();
+# let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+# let mut node = RawNode::new(&config, store, &logger).unwrap();
 # node.raft.become_candidate();
 # node.raft.become_leader();
 use std::{sync::mpsc::{channel, RecvTimeoutError}, time::{Instant, Duration}};
@@ -130,10 +135,12 @@ Here is a simple example to use `propose` and `step`:
 #     time::{Instant, Duration},
 #     collections::HashMap
 # };
+# use slog::{Drain, o};
 #
 # let config = Config { id: 1, ..Default::default() };
 # let store = MemStorage::new_with_conf_state((vec![1], vec![]));
-# let mut node = RawNode::new(&config, store).unwrap();
+# let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+# let mut node = RawNode::new(&config, store, &logger).unwrap();
 # node.raft.become_candidate();
 # node.raft.become_leader();
 #
@@ -144,7 +151,7 @@ Here is a simple example to use `propose` and `step`:
 enum Msg {
     Propose {
         id: u8,
-        callback: Box<Fn() + Send>,
+        callback: Box<dyn Fn() + Send>,
     },
     Raft(Message),
 }
@@ -188,7 +195,16 @@ When your Raft node is ticked and running, Raft should enter a `Ready` state. Yo
 `has_ready` to check whether Raft is ready. If yes, use the `ready` function to get a `Ready`
 state:
 
-```rust,ignore
+```rust
+# use slog::{Drain, o};
+# use raft::{Config, storage::MemStorage, raw_node::RawNode};
+#
+# let config = Config { id: 1, ..Default::default() };
+# config.validate().unwrap();
+# let store = MemStorage::new_with_conf_state((vec![1], vec![]));
+# let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+# let mut node = RawNode::new(&config, store, &logger).unwrap();
+#
 if !node.has_ready() {
     return;
 }
@@ -203,7 +219,21 @@ by one:
 1. Check whether `snapshot` is empty or not. If not empty, it means that the Raft node has received
 a Raft snapshot from the leader and we must apply the snapshot:
 
-    ```rust,ignore
+    ```rust
+    # use slog::{Drain, o};
+    # use raft::{Config, storage::MemStorage, raw_node::RawNode};
+    #
+    # let config = Config { id: 1, ..Default::default() };
+    # config.validate().unwrap();
+    # let store = MemStorage::new_with_conf_state((vec![1], vec![]));
+    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+    # let mut node = RawNode::new(&config, store, &logger).unwrap();
+    #
+    # if !node.has_ready() {
+    #   return;
+    # }
+    # let mut ready = node.ready();
+    #
     if !raft::is_empty_snap(ready.snapshot()) {
         // This is a snapshot, we need to apply the snapshot at first.
         node.mut_store()
@@ -217,8 +247,22 @@ a Raft snapshot from the leader and we must apply the snapshot:
 2. Check whether `entries` is empty or not. If not empty, it means that there are newly added
 entries but has not been committed yet, we must append the entries to the Raft log:
 
-    ```rust,ignore
-    if !ready.entries.is_empty() {
+    ```rust
+    # use slog::{Drain, o};
+    # use raft::{Config, storage::MemStorage, raw_node::RawNode};
+    #
+    # let config = Config { id: 1, ..Default::default() };
+    # config.validate().unwrap();
+    # let store = MemStorage::new_with_conf_state((vec![1], vec![]));
+    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+    # let mut node = RawNode::new(&config, store, &logger).unwrap();
+    #
+    # if !node.has_ready() {
+    #   return;
+    # }
+    # let mut ready = node.ready();
+    #
+    if !ready.entries().is_empty() {
         // Append entries to the Raft log
         node.mut_store().wl().append(ready.entries()).unwrap();
     }
@@ -229,7 +273,21 @@ entries but has not been committed yet, we must append the entries to the Raft l
 changed. For example, the node may vote for a new leader, or the commit index has been increased.
 We must persist the changed `HardState`:
 
-    ```rust,ignore
+    ```rust
+    # use slog::{Drain, o};
+    # use raft::{Config, storage::MemStorage, raw_node::RawNode};
+    #
+    # let config = Config { id: 1, ..Default::default() };
+    # config.validate().unwrap();
+    # let store = MemStorage::new_with_conf_state((vec![1], vec![]));
+    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+    # let mut node = RawNode::new(&config, store, &logger).unwrap();
+    #
+    # if !node.has_ready() {
+    #   return;
+    # }
+    # let mut ready = node.ready();
+    #
     if let Some(hs) = ready.hs() {
         // Raft HardState changed, and we need to persist it.
         node.mut_store().wl().set_hardstate(hs.clone());
@@ -241,7 +299,22 @@ other nodes. There has been an optimization for sending messages: if the node is
 be done together with step 1 in parallel; if the node is not a leader, it needs to reply the
 messages to the leader after appending the Raft entries:
 
-    ```rust,ignore
+    ```rust
+    # use slog::{Drain, o};
+    # use raft::{Config, storage::MemStorage, raw_node::RawNode, StateRole};
+    #
+    # let config = Config { id: 1, ..Default::default() };
+    # config.validate().unwrap();
+    # let store = MemStorage::new_with_conf_state((vec![1], vec![]));
+    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+    # let mut node = RawNode::new(&config, store, &logger).unwrap();
+    #
+    # if !node.has_ready() {
+    #   return;
+    # }
+    # let mut ready = node.ready();
+    # let is_leader = node.raft.state == StateRole::Leader;
+    #
     if !is_leader {
         // If not leader, the follower needs to reply the messages to
         // the leader after appending Raft entries.
@@ -256,7 +329,27 @@ messages to the leader after appending the Raft entries:
 committed log entries which you must apply to the state machine. Of course, after applying, you
 need to update the applied index and resume `apply` later:
 
-    ```rust,ignore
+    ```rust
+    # use slog::{Drain, o};
+    # use raft::{Config, storage::MemStorage, raw_node::RawNode, eraftpb::EntryType};
+    #
+    # let config = Config { id: 1, ..Default::default() };
+    # config.validate().unwrap();
+    # let store = MemStorage::new_with_conf_state((vec![1], vec![]));
+    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+    # let mut node = RawNode::new(&config, store, &logger).unwrap();
+    #
+    # if !node.has_ready() {
+    #   return;
+    # }
+    # let mut ready = node.ready();
+    #
+    # fn handle_conf_change(e:  raft::eraftpb::Entry) {
+    # }
+    #
+    # fn handle_normal(e:  raft::eraftpb::Entry) {
+    # }
+    #
     if let Some(committed_entries) = ready.committed_entries.take() {
         let mut _last_apply_index = 0;
         for entry in committed_entries {
@@ -272,6 +365,7 @@ need to update the applied index and resume `apply` later:
             match entry.get_entry_type() {
                 EntryType::EntryNormal => handle_normal(entry),
                 EntryType::EntryConfChange => handle_conf_change(entry),
+                EntryType::EntryConfChangeV2 => unimplemented!(),
             }
         }
     }
@@ -279,7 +373,21 @@ need to update the applied index and resume `apply` later:
 
 6. Call `advance` to prepare for the next `Ready` state.
 
-    ```rust,ignore
+    ```rust
+    # use slog::{Drain, o};
+    # use raft::{Config, storage::MemStorage, raw_node::RawNode, eraftpb::EntryType};
+    #
+    # let config = Config { id: 1, ..Default::default() };
+    # config.validate().unwrap();
+    # let store = MemStorage::new_with_conf_state((vec![1], vec![]));
+    # let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+    # let mut node = RawNode::new(&config, store, &logger).unwrap();
+    #
+    # if !node.has_ready() {
+    #   return;
+    # }
+    # let mut ready = node.ready();
+    #
     node.advance(ready);
     ```
 
@@ -318,45 +426,15 @@ This means it's possible to do:
 ```rust
 use raft::{Config, storage::MemStorage, raw_node::RawNode, eraftpb::*};
 use protobuf::Message as PbMessage;
+use slog::{Drain, o};
+
 let mut config = Config { id: 1, ..Default::default() };
 let store = MemStorage::new_with_conf_state((vec![1, 2], vec![]));
-let mut node = RawNode::new(&mut config, store).unwrap();
+let logger = slog::Logger::root(slog_stdlog::StdLog.fuse(), o!());
+let mut node = RawNode::new(&mut config, store, &logger).unwrap();
 node.raft.become_candidate();
 node.raft.become_leader();
 
-// Call this on the leader, or send the command via a normal `MsgPropose`.
-node.raft.propose_membership_change((
-    // Any IntoIterator<Item=u64>.
-    // Voters
-    vec![1,3], // Remove 2, add 3.
-    // Learners
-    vec![4,5,6], // Add 4, 5, 6.
-)).unwrap();
-# let idx = node.raft.raft_log.last_index();
-
-# let entry = &node.raft.raft_log.entries(idx, 1).unwrap()[0];
-// ...Later when the begin entry is recieved from a `ready()` in the `entries` field...
-let mut conf_change = ConfChange::default();
-conf_change.merge_from_bytes(&entry.data).unwrap();
-node.raft.begin_membership_change(&conf_change).unwrap();
-assert!(node.raft.is_in_membership_change());
-assert!(node.raft.prs().voter_ids().contains(&2));
-assert!(node.raft.prs().voter_ids().contains(&3));
-#
-# // We hide this since the user isn't really encouraged to blindly call this, but we'd like a short
-# // example.
-# node.raft.raft_log.commit_to(idx);
-# node.raft.commit_apply(idx);
-#
-# let idx = node.raft.raft_log.last_index();
-# let entry = &node.raft.raft_log.entries(idx, 1).unwrap()[0];
-// ...Later, when the finalize entry is recieved from a `ready()` in the `entries` field...
-let mut conf_change = ConfChange::default();
-conf_change.merge_from_bytes(&entry.data).unwrap();
-node.raft.finalize_membership_change(&conf_change).unwrap();
-assert!(!node.raft.prs().voter_ids().contains(&2));
-assert!(node.raft.prs().voter_ids().contains(&3));
-assert!(!node.raft.is_in_membership_change());
 ```
 
 This process is a two-phase process, during the midst of it the peer group's leader is managing
@@ -374,6 +452,8 @@ before taking old, removed peers offline.
 #![recursion_limit = "128"]
 // This is necessary to support prost and rust-protobuf at the same time.
 #![allow(clippy::identity_conversion)]
+// This lint recommends some bad choices sometimes.
+#![allow(clippy::unnecessary_unwrap)]
 
 #[cfg(feature = "failpoints")]
 #[macro_use]
@@ -385,6 +465,21 @@ extern crate slog;
 extern crate quick_error;
 #[macro_use]
 extern crate getset;
+
+macro_rules! fatal {
+    ($logger:expr, $msg:expr) => {{
+        let owned_kv = ($logger).list();
+        let s = crate::util::format_kv_list(&owned_kv);
+        if s.is_empty() {
+            panic!("{}", $msg)
+        } else {
+            panic!("{}, {}", $msg, s)
+        }
+    }};
+    ($logger:expr, $fmt:expr, $($arg:tt)+) => {{
+        fatal!($logger, format_args!($fmt, $($arg)+))
+    }};
+}
 
 mod config;
 mod errors;
@@ -414,7 +509,6 @@ pub use self::read_only::{ReadOnlyOption, ReadState};
 pub use self::status::{Status, StatusRef};
 pub use self::storage::{RaftState, Storage};
 pub use raft_proto::eraftpb;
-use slog::{Drain, Logger};
 
 pub mod prelude {
     //! A "prelude" for crates using the `raft` crate.
@@ -448,18 +542,33 @@ pub mod prelude {
 /// The default logger we fall back to when passed `None` in external facing constructors.
 ///
 /// Currently, this is a `log` adaptor behind a `Once` to ensure there is no clobbering.
-#[doc(hidden)]
-fn default_logger() -> &'static Logger {
+#[cfg(any(test, feature = "default-logger"))]
+pub fn default_logger() -> slog::Logger {
+    use slog::Drain;
     use std::sync::{Mutex, Once};
-    static LOGGER_INITIALIZED: Once = Once::new();
-    static mut LOGGER: Option<Logger> = None;
 
-    unsafe {
+    static LOGGER_INITIALIZED: Once = Once::new();
+    static mut LOGGER: Option<slog::Logger> = None;
+
+    let logger = unsafe {
         LOGGER_INITIALIZED.call_once(|| {
-            let drain = slog_stdlog::StdLog.fuse();
-            let drain = slog_envlogger::new(drain).fuse();
+            let decorator = slog_term::TermDecorator::new().build();
+            let drain = slog_term::CompactFormat::new(decorator).build();
+            let drain = slog_envlogger::new(drain);
             LOGGER = Some(slog::Logger::root(Mutex::new(drain).fuse(), o!()));
         });
         LOGGER.as_ref().unwrap()
+    };
+    if let Some(case) = std::thread::current()
+        .name()
+        .and_then(|v| v.split(':').last())
+    {
+        logger.new(o!("case" => case.to_string()))
+    } else {
+        logger.new(o!())
     }
 }
+
+type DefaultHashBuilder = std::hash::BuildHasherDefault<fxhash::FxHasher>;
+type HashMap<K, V> = std::collections::HashMap<K, V, DefaultHashBuilder>;
+type HashSet<K> = std::collections::HashSet<K, DefaultHashBuilder>;

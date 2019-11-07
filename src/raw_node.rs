@@ -35,7 +35,6 @@ use std::mem;
 use protobuf::Message as PbMessage;
 
 use crate::config::Config;
-use crate::default_logger;
 use crate::eraftpb::{
     ConfChange, ConfChangeType, ConfState, Entry, EntryType, HardState, Message, MessageType,
     Snapshot,
@@ -215,34 +214,36 @@ pub struct RawNode<T: Storage> {
     pub raft: Raft<T>,
     prev_ss: SoftState,
     prev_hs: HardState,
-    logger: Logger,
 }
 
 impl<T: Storage> RawNode<T> {
     #[allow(clippy::new_ret_no_self)]
     /// Create a new RawNode given some [`Config`](../struct.Config.html).
-    pub fn new(config: &Config, store: T) -> Result<RawNode<T>> {
-        let logger = default_logger().new(o!());
+    pub fn new(config: &Config, store: T, logger: &Logger) -> Result<Self> {
         assert_ne!(config.id, 0, "config.id must not be zero");
-        let r = Raft::new(config, store)?;
+        let r = Raft::new(config, store, logger)?;
         let mut rn = RawNode {
             raft: r,
             prev_hs: Default::default(),
             prev_ss: Default::default(),
-            logger,
         };
         rn.prev_hs = rn.raft.hard_state();
         rn.prev_ss = rn.raft.soft_state();
-        info!(rn.logger, "RawNode created with id {id}.", id = rn.raft.id);
+        info!(
+            rn.raft.logger,
+            "RawNode created with id {id}.",
+            id = rn.raft.id
+        );
         Ok(rn)
     }
 
-    /// Set a logger.
-    #[inline(always)]
-    pub fn with_logger(mut self, logger: &Logger) -> Self {
-        self.logger = logger.new(o!());
-        self.raft = self.raft.with_logger(logger);
-        self
+    /// Create a new RawNode given some [`Config`](../struct.Config.html) and the default logger.
+    ///
+    /// The default logger is an `slog` to `log` adapter.
+    #[cfg(feature = "default-logger")]
+    #[allow(clippy::new_ret_no_self)]
+    pub fn with_default_logger(c: &Config, store: T) -> Result<Self> {
+        Self::new(c, store, &crate::default_logger())
     }
 
     fn commit_ready(&mut self, rd: Ready) {
@@ -321,18 +322,10 @@ impl<T: Storage> RawNode<T> {
     }
 
     /// Takes the conf change and applies it.
-    ///
-    /// # Panics
-    ///
-    /// In the case of `BeginMembershipChange` or `FinalizeConfChange` returning errors this will panic.
-    ///
-    /// For a safe interface for these directly call `this.raft.begin_membership_change(entry)` or
-    /// `this.raft.finalize_membership_change(entry)` respectively.
     pub fn apply_conf_change(&mut self, cc: &ConfChange) -> Result<ConfState> {
-        if cc.node_id == INVALID_ID && cc.get_change_type() != ConfChangeType::BeginMembershipChange
-        {
+        if cc.node_id == INVALID_ID {
             let mut cs = ConfState::default();
-            cs.nodes = self.raft.prs().voter_ids().iter().cloned().collect();
+            cs.voters = self.raft.prs().voter_ids().iter().cloned().collect();
             cs.learners = self.raft.prs().learner_ids().iter().cloned().collect();
             return Ok(cs);
         }
@@ -341,13 +334,9 @@ impl<T: Storage> RawNode<T> {
             ConfChangeType::AddNode => self.raft.add_node(nid)?,
             ConfChangeType::AddLearnerNode => self.raft.add_learner(nid)?,
             ConfChangeType::RemoveNode => self.raft.remove_node(nid)?,
-            ConfChangeType::BeginMembershipChange => self.raft.begin_membership_change(cc)?,
-            ConfChangeType::FinalizeMembershipChange => {
-                self.raft.mut_prs().finalize_membership_change()?
-            }
         };
 
-        Ok(self.raft.prs().configuration().clone().into())
+        Ok(self.raft.prs().configuration().to_conf_state())
     }
 
     /// Step advances the state machine using the given message.
@@ -386,7 +375,7 @@ impl<T: Storage> RawNode<T> {
         if !raft.read_states.is_empty() {
             return true;
         }
-        if self.get_snap().map_or(false, |s| !is_empty_snap(s)) {
+        if self.snap().map_or(false, |s| !is_empty_snap(s)) {
             return true;
         }
         let has_unapplied_entries = match applied_idx {
@@ -415,8 +404,8 @@ impl<T: Storage> RawNode<T> {
 
     /// Grabs the snapshot from the raft if available.
     #[inline]
-    pub fn get_snap(&self) -> Option<&Snapshot> {
-        self.raft.get_snap()
+    pub fn snap(&self) -> Option<&Snapshot> {
+        self.raft.snap()
     }
 
     /// Advance notifies the RawNode that the application has applied and saved progress in the
@@ -512,8 +501,8 @@ impl<T: Storage> RawNode<T> {
 
     /// Returns the store as an immutable reference.
     #[inline]
-    pub fn get_store(&self) -> &T {
-        self.raft.get_store()
+    pub fn store(&self) -> &T {
+        self.raft.store()
     }
 
     /// Returns the store as a mutable reference.

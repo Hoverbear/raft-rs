@@ -25,14 +25,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::default_logger;
+use std::cell::RefCell;
+
+use slog::Logger;
+
 use crate::eraftpb::{ConfState, SnapshotMetadata};
 use crate::errors::{Error, Result};
 use crate::progress::Progress;
-use hashbrown::hash_map::DefaultHashBuilder;
-use hashbrown::{HashMap, HashSet};
-use slog::Logger;
-use std::cell::RefCell;
+use crate::{DefaultHashBuilder, HashMap, HashSet};
 
 /// Get the majority number of given nodes count.
 #[inline]
@@ -64,6 +64,22 @@ impl Configuration {
             learners: learners.into_iter().collect(),
         }
     }
+
+    /// Create a new `ConfState` from the configuration itself.
+    pub fn to_conf_state(&self) -> ConfState {
+        let mut state = ConfState::default();
+        state.set_voters(self.voters.iter().cloned().collect());
+        state.set_learners(self.learners.iter().cloned().collect());
+        state
+    }
+
+    /// Create a new `Configuration` from a given `ConfState`.
+    pub fn from_conf_state(conf_state: &ConfState) -> Self {
+        Self {
+            voters: conf_state.voters.iter().cloned().collect(),
+            learners: conf_state.learners.iter().cloned().collect(),
+        }
+    }
 }
 
 impl<Iter1, Iter2> From<(Iter1, Iter2)> for Configuration
@@ -76,24 +92,6 @@ where
             voters: voters.into_iter().collect(),
             learners: learners.into_iter().collect(),
         }
-    }
-}
-
-impl From<ConfState> for Configuration {
-    fn from(conf_state: ConfState) -> Self {
-        Self {
-            voters: conf_state.nodes.iter().cloned().collect(),
-            learners: conf_state.learners.iter().cloned().collect(),
-        }
-    }
-}
-
-impl From<Configuration> for ConfState {
-    fn from(conf: Configuration) -> Self {
-        let mut state = ConfState::default();
-        state.nodes = conf.voters.iter().cloned().collect();
-        state.learners = conf.learners.iter().cloned().collect();
-        state
     }
 }
 
@@ -151,92 +149,61 @@ pub enum CandidacyStatus {
 #[derive(Clone, Getters)]
 pub struct ProgressSet {
     progress: HashMap<u64, Progress>,
+
     /// The current configuration state of the cluster.
     #[get = "pub"]
     configuration: Configuration,
-    /// The pending configuration, which will be adopted after the Finalize entry is applied.
-    #[get = "pub"]
-    next_configuration: Option<Configuration>,
-    configuration_capacity: (usize, usize),
+
     // A preallocated buffer for sorting in the maximal_committed_index function.
     // You should not depend on these values unless you just set them.
     // We use a cell to avoid taking a `&mut self`.
     sort_buffer: RefCell<Vec<u64>>,
-    logger: Logger,
-}
-
-impl Default for ProgressSet {
-    fn default() -> ProgressSet {
-        ProgressSet::new()
-    }
+    pub(crate) logger: Logger,
 }
 
 impl ProgressSet {
     /// Creates a new ProgressSet.
-    pub fn new() -> Self {
-        Self::with_capacity(0, 0)
+    pub fn new(logger: Logger) -> Self {
+        Self::with_capacity(0, 0, logger)
     }
 
     /// Create a progress set with the specified sizes already reserved.
-    pub fn with_capacity(voters: usize, learners: usize) -> Self {
+    pub fn with_capacity(voters: usize, learners: usize, logger: Logger) -> Self {
         ProgressSet {
             progress: HashMap::with_capacity_and_hasher(
                 voters + learners,
                 DefaultHashBuilder::default(),
             ),
             sort_buffer: RefCell::from(Vec::with_capacity(voters)),
-            configuration_capacity: (voters, learners),
             configuration: Configuration::with_capacity(voters, learners),
-            next_configuration: Option::default(),
-            logger: default_logger().new(o!()),
+            logger,
         }
     }
 
-    /// Set a logger.
-    #[inline(always)]
-    pub fn with_logger(mut self, logger: &Logger) -> Self {
-        self.logger = logger.new(o!());
-        self
+    fn clear(&mut self) {
+        self.progress.clear();
+        self.configuration.voters.clear();
+        self.configuration.learners.clear();
     }
 
     pub(crate) fn restore_snapmeta(
+        &mut self,
         meta: &SnapshotMetadata,
         next_idx: u64,
         max_inflight: usize,
-        logger: &Logger,
-    ) -> Self {
-        let mut prs = ProgressSet::new().with_logger(logger);
-
+    ) {
+        self.clear();
         let pr = Progress::new(next_idx, max_inflight);
-        meta.get_conf_state().nodes.iter().for_each(|id| {
-            prs.progress.insert(*id, pr.clone());
-            prs.configuration.voters.insert(*id);
-        });
-        meta.get_conf_state().learners.iter().for_each(|id| {
-            prs.progress.insert(*id, pr.clone());
-            prs.configuration.learners.insert(*id);
-        });
-
-        if meta.pending_membership_change_index != 0 {
-            let mut next_configuration = Configuration::with_capacity(0, 0);
-            meta.get_pending_membership_change()
-                .nodes
-                .iter()
-                .for_each(|id| {
-                    prs.progress.insert(*id, pr.clone());
-                    next_configuration.voters.insert(*id);
-                });
-            meta.get_pending_membership_change()
-                .learners
-                .iter()
-                .for_each(|id| {
-                    prs.progress.insert(*id, pr.clone());
-                    next_configuration.learners.insert(*id);
-                });
-            prs.next_configuration = Some(next_configuration);
+        for id in &meta.conf_state.as_ref().unwrap().voters {
+            self.progress.insert(*id, pr.clone());
+            self.configuration.voters.insert(*id);
         }
-        prs.assert_progress_and_configuration_consistent();
-        prs
+        for id in &meta.conf_state.as_ref().unwrap().learners {
+            self.progress.insert(*id, pr.clone());
+            self.configuration.learners.insert(*id);
+        }
+
+        self.assert_progress_and_configuration_consistent();
     }
 
     /// Returns the status of voters.
@@ -289,15 +256,7 @@ impl ProgressSet {
     /// transitioning to a new configuration and have two qourums. Use `has_quorum` instead.
     #[inline]
     pub fn voter_ids(&self) -> HashSet<u64> {
-        match self.next_configuration {
-            Some(ref next) => self
-                .configuration
-                .voters
-                .union(&next.voters)
-                .cloned()
-                .collect::<HashSet<u64>>(),
-            None => self.configuration.voters.clone(),
-        }
+        self.configuration().voters().clone()
     }
 
     /// Returns the ids of all known learners.
@@ -306,15 +265,7 @@ impl ProgressSet {
     /// transitioning to a new configuration and have two qourums. Use `has_quorum` instead.
     #[inline]
     pub fn learner_ids(&self) -> HashSet<u64> {
-        match self.next_configuration {
-            Some(ref next) => self
-                .configuration
-                .learners
-                .union(&next.learners)
-                .cloned()
-                .collect::<HashSet<u64>>(),
-            None => self.configuration.learners.clone(),
-        }
+        self.configuration().learners().clone()
     }
 
     /// Grabs a reference to the progress of a node.
@@ -353,7 +304,6 @@ impl ProgressSet {
     ///
     /// * `id` is in the voter set.
     /// * `id` is in the learner set.
-    /// * There is a pending membership change.
     pub fn insert_voter(&mut self, id: u64, pr: Progress) -> Result<()> {
         debug!(self.logger, "Inserting voter with id {id}", id = id);
 
@@ -361,15 +311,10 @@ impl ProgressSet {
             return Err(Error::Exists(id, "learners"));
         } else if self.voter_ids().contains(&id) {
             return Err(Error::Exists(id, "voters"));
-        } else if self.is_in_membership_change() {
-            return Err(Error::ViolatesContract(
-                "There is a pending membership change.".into(),
-            ));
         }
 
         self.configuration.voters.insert(id);
         self.progress.insert(id, pr);
-
         self.assert_progress_and_configuration_consistent();
         Ok(())
     }
@@ -380,7 +325,6 @@ impl ProgressSet {
     ///
     /// * `id` is in the voter set.
     /// * `id` is in the learner set.
-    /// * There is a pending membership change.
     pub fn insert_learner(&mut self, id: u64, pr: Progress) -> Result<()> {
         debug!(self.logger, "Inserting learner with id {id}", id = id);
 
@@ -388,15 +332,10 @@ impl ProgressSet {
             return Err(Error::Exists(id, "learners"));
         } else if self.voter_ids().contains(&id) {
             return Err(Error::Exists(id, "voters"));
-        } else if self.is_in_membership_change() {
-            return Err(Error::ViolatesContract(
-                "There is a pending membership change".into(),
-            ));
         }
 
         self.configuration.learners.insert(id);
         self.progress.insert(id, pr);
-
         self.assert_progress_and_configuration_consistent();
         Ok(())
     }
@@ -405,16 +344,8 @@ impl ProgressSet {
     ///
     /// # Errors
     ///
-    /// * There is a pending membership change.
     pub fn remove(&mut self, id: u64) -> Result<Option<Progress>> {
         debug!(self.logger, "Removing peer with id {id}", id = id);
-
-        if self.is_in_membership_change() {
-            return Err(Error::ViolatesContract(
-                "There is a pending membership change.".into(),
-            ));
-        }
-
         self.configuration.learners.remove(&id);
         self.configuration.voters.remove(&id);
         let removed = self.progress.remove(&id);
@@ -426,12 +357,6 @@ impl ProgressSet {
     /// Promote a learner to a peer.
     pub fn promote_learner(&mut self, id: u64) -> Result<()> {
         debug!(self.logger, "Promoting peer with id {id}", id = id);
-
-        if self.is_in_membership_change() {
-            return Err(Error::ViolatesContract(
-                "There is a pending membership change.".into(),
-            ));
-        }
 
         if !self.configuration.learners.remove(&id) {
             // Wasn't already a learner. We can't promote what doesn't exist.
@@ -453,19 +378,6 @@ impl ProgressSet {
             .voters
             .union(&self.configuration.learners)
             .all(|v| self.progress.contains_key(v)));
-        debug_assert!(self
-            .progress
-            .keys()
-            .all(|v| self.configuration.learners.contains(v)
-                || self.configuration.voters.contains(v)
-                || self
-                    .next_configuration
-                    .as_ref()
-                    .map_or(false, |c| c.learners.contains(v))
-                || self
-                    .next_configuration
-                    .as_ref()
-                    .map_or(false, |c| c.voters.contains(v))));
         assert_eq!(
             self.voter_ids().len() + self.learner_ids().len(),
             self.progress.len()
@@ -484,22 +396,7 @@ impl ProgressSet {
         });
         // Reverse sort.
         matched.sort_by(|a, b| b.cmp(a));
-        let mut mci = matched[matched.len() / 2];
-
-        if let Some(next) = &self.next_configuration {
-            matched.clear();
-            next.voters().iter().for_each(|id| {
-                let peer = &self.progress[id];
-                matched.push(peer.matched);
-            });
-            // Reverse sort.
-            matched.sort_by(|a, b| b.cmp(a));
-            let next_mci = matched[matched.len() / 2];
-            if next_mci < mci {
-                mci = next_mci;
-            }
-        }
-        mci
+        matched[matched.len() / 2]
     }
 
     /// Returns the Candidate's eligibility in the current election.
@@ -523,23 +420,11 @@ impl ProgressSet {
             },
         );
 
-        match self.next_configuration {
-            Some(ref next) => {
-                if next.has_quorum(&accepts) && self.configuration.has_quorum(&accepts) {
-                    return CandidacyStatus::Elected;
-                } else if next.has_quorum(&rejects) || self.configuration.has_quorum(&rejects) {
-                    return CandidacyStatus::Ineligible;
-                }
-            }
-            None => {
-                if self.configuration.has_quorum(&accepts) {
-                    return CandidacyStatus::Elected;
-                } else if self.configuration.has_quorum(&rejects) {
-                    return CandidacyStatus::Ineligible;
-                }
-            }
-        };
-
+        if self.configuration.has_quorum(&accepts) {
+            return CandidacyStatus::Elected;
+        } else if self.configuration.has_quorum(&rejects) {
+            return CandidacyStatus::Ineligible;
+        }
         CandidacyStatus::Eligible
     }
 
@@ -557,14 +442,11 @@ impl ProgressSet {
             if pr.recent_active {
                 active.insert(id);
             }
+        }
+        for pr in self.progress.values_mut() {
             pr.recent_active = false;
         }
-        for (&_id, pr) in self.learners_mut() {
-            pr.recent_active = false;
-        }
-        self.configuration.has_quorum(&active) &&
-            // If `next` is `None` we don't consider it, so just `true` it.
-            self.next_configuration.as_ref().map(|next| next.has_quorum(&active)).unwrap_or(true)
+        self.configuration.has_quorum(&active)
     }
 
     /// Determine if a quorum is formed from the given set of nodes.
@@ -573,106 +455,6 @@ impl ProgressSet {
     #[inline]
     pub fn has_quorum(&self, potential_quorum: &HashSet<u64>) -> bool {
         self.configuration.has_quorum(potential_quorum)
-            && self
-                .next_configuration
-                .as_ref()
-                .map(|next| next.has_quorum(potential_quorum))
-                // If `next` is `None` we don't consider it, so just `true` it.
-                .unwrap_or(true)
-    }
-
-    /// Determine if the ProgressSet is represented by a transition state under Joint Consensus.
-    #[inline]
-    pub fn is_in_membership_change(&self) -> bool {
-        self.next_configuration.is_some()
-    }
-
-    /// Enter a joint consensus state to transition to the specified configuration.
-    ///
-    /// The `next` provided should be derived from the `ConfChange` message. `progress` is used as
-    /// a basis for created peer `Progress` values. You are only expected to set `ins` from the
-    /// `raft.max_inflights` value.
-    ///
-    /// Once this state is entered the leader should replicate the `ConfChange` message. After the
-    /// majority of nodes, in both the current and the `next`, have committed the union state. At
-    /// this point the leader can call `finalize_config_transition` and replicate a message
-    /// commiting the change.
-    ///
-    /// Valid transitions:
-    /// * Non-existing -> Learner
-    /// * Non-existing -> Voter
-    /// * Learner -> Voter
-    /// * Learner -> Non-existing
-    /// * Voter -> Non-existing
-    ///
-    /// Errors:
-    /// * Voter -> Learner
-    /// * Member as voter and learner.
-    /// * Empty voter set.
-    pub(crate) fn begin_membership_change(
-        &mut self,
-        next: impl Into<Configuration>,
-        mut progress: Progress,
-    ) -> Result<()> {
-        let next = next.into();
-        next.valid()?;
-        // Demotion check.
-        if let Some(&demoted) = self
-            .configuration
-            .voters
-            .intersection(&next.learners)
-            .next()
-        {
-            return Err(Error::Exists(demoted, "learners"));
-        }
-        debug!(
-            self.logger,
-            "Beginning membership change";
-            "next" => ?next,
-        );
-
-        // When a peer is first added/promoted, we should mark it as recently active.
-        // Otherwise, check_quorum may cause us to step down if it is invoked
-        // before the added peer has a chance to communicate with us.
-        progress.recent_active = true;
-        progress.paused = false;
-        for id in next.voters.iter().chain(&next.learners) {
-            // Now we create progresses for any that do not exist.
-            self.progress.entry(*id).or_insert_with(|| progress.clone());
-        }
-        self.next_configuration = Some(next);
-        Ok(())
-    }
-
-    /// Finalizes the joint consensus state and transitions solely to the new state.
-    ///
-    /// This must be called only after calling `begin_membership_change` and after the majority
-    /// of peers in both the `current` and the `next` state have committed the changes.
-    pub fn finalize_membership_change(&mut self) -> Result<()> {
-        let next = self.next_configuration.take();
-        match next {
-            None => Err(Error::NoPendingMembershipChange),
-            Some(next) => {
-                {
-                    let pending = self
-                        .configuration
-                        .voters()
-                        .difference(next.voters())
-                        .chain(self.configuration.learners().difference(next.learners()))
-                        .cloned();
-                    for id in pending {
-                        self.progress.remove(&id);
-                    }
-                }
-                self.configuration = next;
-                debug!(
-                    self.logger,
-                    "Finalizing membership change";
-                    "config" => ?self.configuration,
-                );
-                Ok(())
-            }
-        }
     }
 }
 
@@ -680,17 +462,15 @@ impl ProgressSet {
 // See https://github.com/pingcap/raft-rs/issues/125
 #[cfg(test)]
 mod test_progress_set {
-    use super::{Configuration, ProgressSet, Result};
+    use super::{ProgressSet, Result};
     use crate::default_logger;
     use crate::progress::Progress;
-    use hashbrown::HashSet;
 
     const CANARY: u64 = 123;
 
     #[test]
     fn test_insert_redundant_voter() -> Result<()> {
-        let l = default_logger().new(o!("test" => "test_insert_redundant_voter"));
-        let mut set = ProgressSet::new().with_logger(&l);
+        let mut set = ProgressSet::new(default_logger());
         let default_progress = Progress::new(0, 256);
         let mut canary_progress = Progress::new(0, 256);
         canary_progress.matched = CANARY;
@@ -709,8 +489,7 @@ mod test_progress_set {
 
     #[test]
     fn test_insert_redundant_learner() -> Result<()> {
-        let l = default_logger().new(o!("test" => "test_insert_redundant_learner"));
-        let mut set = ProgressSet::new().with_logger(&l);
+        let mut set = ProgressSet::new(default_logger());
         let default_progress = Progress::new(0, 256);
         let mut canary_progress = Progress::new(0, 256);
         canary_progress.matched = CANARY;
@@ -729,8 +508,7 @@ mod test_progress_set {
 
     #[test]
     fn test_insert_learner_that_is_voter() -> Result<()> {
-        let l = default_logger().new(o!("test" => "test_insert_learner_that_is_voter"));
-        let mut set = ProgressSet::new().with_logger(&l);
+        let mut set = ProgressSet::new(default_logger());
         let default_progress = Progress::new(0, 256);
         let mut canary_progress = Progress::new(0, 256);
         canary_progress.matched = CANARY;
@@ -749,8 +527,7 @@ mod test_progress_set {
 
     #[test]
     fn test_insert_voter_that_is_learner() -> Result<()> {
-        let l = default_logger().new(o!("test" => "test_insert_voter_that_is_learner"));
-        let mut set = ProgressSet::new().with_logger(&l);
+        let mut set = ProgressSet::new(default_logger());
         let default_progress = Progress::new(0, 256);
         let mut canary_progress = Progress::new(0, 256);
         canary_progress.matched = CANARY;
@@ -769,8 +546,7 @@ mod test_progress_set {
 
     #[test]
     fn test_promote_learner() -> Result<()> {
-        let l = default_logger().new(o!("test" => "test_promote_learner"));
-        let mut set = ProgressSet::new().with_logger(&l);
+        let mut set = ProgressSet::new(default_logger());
         let default_progress = Progress::new(0, 256);
         set.insert_voter(1, default_progress)?;
         let pre = set.get(1).expect("Should have been inserted").clone();
@@ -783,104 +559,6 @@ mod test_progress_set {
             "Should return an error on invalid promote_learner."
         );
         assert_eq!(pre, *set.get(1).expect("Peer should not have been deleted"));
-        Ok(())
-    }
-
-    #[test]
-    fn test_membership_change_configuration_remove_voter() -> Result<()> {
-        check_membership_change_configuration((vec![1, 2], vec![]), (vec![1], vec![]))
-    }
-
-    #[test]
-    fn test_membership_change_configuration_remove_learner() -> Result<()> {
-        check_membership_change_configuration((vec![1], vec![2]), (vec![1], vec![]))
-    }
-
-    #[test]
-    fn test_membership_change_configuration_conflicting_sets() {
-        assert!(
-            check_membership_change_configuration((vec![1], vec![]), (vec![1], vec![1]),).is_err()
-        )
-    }
-
-    #[test]
-    fn test_membership_change_configuration_empty_sets() {
-        assert!(check_membership_change_configuration((vec![], vec![]), (vec![], vec![])).is_err())
-    }
-
-    #[test]
-    fn test_membership_change_configuration_empty_voters() {
-        assert!(
-            check_membership_change_configuration((vec![1], vec![]), (vec![], vec![]),).is_err()
-        )
-    }
-
-    #[test]
-    fn test_membership_change_configuration_add_voter() -> Result<()> {
-        check_membership_change_configuration((vec![1], vec![]), (vec![1, 2], vec![]))
-    }
-
-    #[test]
-    fn test_membership_change_configuration_add_learner() -> Result<()> {
-        check_membership_change_configuration((vec![1], vec![]), (vec![1], vec![2]))
-    }
-
-    #[test]
-    fn test_membership_change_configuration_promote_learner() -> Result<()> {
-        check_membership_change_configuration((vec![1], vec![2]), (vec![1, 2], vec![]))
-    }
-
-    fn check_membership_change_configuration(
-        start: (impl IntoIterator<Item = u64>, impl IntoIterator<Item = u64>),
-        end: (impl IntoIterator<Item = u64>, impl IntoIterator<Item = u64>),
-    ) -> Result<()> {
-        let l = default_logger().new(o!("test" => "check_membership_change_configuration"));
-        let start_voters = start.0.into_iter().collect::<HashSet<u64>>();
-        let start_learners = start.1.into_iter().collect::<HashSet<u64>>();
-        let end_voters = end.0.into_iter().collect::<HashSet<u64>>();
-        let end_learners = end.1.into_iter().collect::<HashSet<u64>>();
-        let transition_voters = start_voters
-            .union(&end_voters)
-            .cloned()
-            .collect::<HashSet<u64>>();
-        let transition_learners = start_learners
-            .union(&end_learners)
-            .cloned()
-            .collect::<HashSet<u64>>();
-
-        let mut set = ProgressSet::new().with_logger(&l);
-        let default_progress = Progress::new(0, 10);
-
-        for starter in start_voters {
-            set.insert_voter(starter, default_progress.clone())?;
-        }
-        for starter in start_learners {
-            set.insert_learner(starter, default_progress.clone())?;
-        }
-        set.begin_membership_change(
-            Configuration::new(end_voters.clone(), end_learners.clone()),
-            default_progress,
-        )?;
-        assert!(set.is_in_membership_change());
-        assert_eq!(
-            set.voter_ids(),
-            transition_voters,
-            "Transition state voters inaccurate"
-        );
-        assert_eq!(
-            set.learner_ids(),
-            transition_learners,
-            "Transition state learners inaccurate."
-        );
-
-        set.finalize_membership_change()?;
-        assert!(!set.is_in_membership_change());
-        assert_eq!(set.voter_ids(), end_voters, "End state voters inaccurate");
-        assert_eq!(
-            set.learner_ids(),
-            end_learners,
-            "End state learners inaccurate"
-        );
         Ok(())
     }
 }
